@@ -22,8 +22,8 @@ def get_default_config():
             "initial_learning_steps": 30_000,
             "initial_collection_steps": 30_000,
             "collect_with_policy": False,
-            "eval_interval": 25*10**3,
-            "num_eval_episodes": 10,
+            "eval_interval": 20*10**3,
+            "num_eval_episodes": 50,
             "grad_clip_norm": 40.0,
             "tau": 5e-3,  # Exponential averaging coefficient for target network updates, nu in the paper
             "train_steps_per_iter": 100,

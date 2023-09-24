@@ -613,8 +613,10 @@ class LatentPolicySafetyCriticSlac(SafetyCriticSlacAlgorithm):
         self.epoch_len = 30_000//self.action_repeat
         self.epoch_costreturns = []
         self.epoch_rewardreturns = []
+        self.epoch_safetyviolations = []
         self.episode_costreturn = 0
         self.episode_rewardreturn = 0
+        self.episode_safetyviolation = 0
         
         self.loss_averages = defaultdict(lambda : 0)
 
@@ -639,6 +641,8 @@ class LatentPolicySafetyCriticSlac(SafetyCriticSlacAlgorithm):
         self.lastcost = cost
         self.episode_costreturn += cost
         self.episode_rewardreturn += reward
+        if cost > 0:
+            self.episode_safetyviolation += 1
         mask = False if t >= env._max_episode_steps else done
         ob.append(state, action)
 
@@ -650,8 +654,11 @@ class LatentPolicySafetyCriticSlac(SafetyCriticSlacAlgorithm):
                 
                 self.epoch_costreturns.append(self.episode_costreturn)
                 self.epoch_rewardreturns.append(self.episode_rewardreturn)
+                self.epoch_safetyviolations.append(self.episode_safetyviolation / t)
+                
             self.episode_costreturn = 0
             self.episode_rewardreturn = 0
+            self.episode_safetyviolation = 0
             t = 0
             state = env.reset()
             ob.reset_episode(state)

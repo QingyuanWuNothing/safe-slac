@@ -7,7 +7,7 @@ from tkinter import N
 import numpy as np
 import pandas as pd
 from tensorboardX import SummaryWriter
-from tqdm import tqdm
+from tqdm import tqdm, trange
 from slac.utils import sample_reproduction
 from PIL import Image
 from copy import deepcopy
@@ -89,7 +89,14 @@ class Trainer:
         # Algorithm to learn.
         self.algo = algo
         # Log setting.
-        self.log = {"step": [], "return": [], "cost": []}
+        self.log = {"step": [], 
+                    "mean_return": [],
+                    "std_return": [],
+                    "mean_cost": [], 
+                    "std_cost": [],
+                    "mean_safety_violation": [], 
+                    "std_safety_violation": [],
+                    }
         self.csv_path = os.path.join(log_dir, "log.csv")
         self.log_dir = log_dir
         self.summary_dir = os.path.join(log_dir, "summary")
@@ -122,50 +129,57 @@ class Trainer:
         self.env.unwrapped.sim.render_contexts[0].vopt.geomgroup[:] = 1 # render all objects, including hazards
         self.ob.reset_episode(state)
         self.algo.buffer.reset_episode(state)
-
         # Collect trajectories using random policy.
-        bar = tqdm(range(1, self.initial_collection_steps + 1))
+        bar = tqdm(range(1, self.initial_collection_steps + 1), desc="Collect trajectories using random policy")
         for step in bar:
             t = self.algo.step(self.env, self.ob, t, (not self.collect_with_policy) and step <= self.initial_collection_steps, self.writer)
+        self.algo.save_model(self.model_dir + f"/initial_collecting")
         # Update latent variable model first so that SLAC can learn well using (learned) latent dynamics.
-        bar = tqdm(range(self.initial_learning_steps))
+        bar = tqdm(range(self.initial_learning_steps), desc="Updating latent variable model")
         for _ in bar:
-            bar.set_description("Updating latent variable model.")
             self.algo.update_latent(self.writer)
+        self.algo.save_model(self.model_dir + f"/initial_learning")
 
         # Iterate collection, update and evaluation.
-        for step in range(self.initial_collection_steps + 1, self.num_steps // self.action_repeat + 1):
+        bar = tqdm(range(self.initial_collection_steps + 1, self.num_steps // self.action_repeat + 1), desc="Iterate collection, update and evaluation")
+        for step in bar:
             t = self.algo.step(self.env, self.ob, t, False, self.writer)
+            # Update the lagrange multiplier.
             self.algo.update_lag(t, self.writer)
             # Update the algorithm.
-            if t%self.env_steps_per_train_step==0:
+            if t % self.env_steps_per_train_step == 0:
                 for _ in range(self.train_steps_per_iter):
-                    
                     self.algo.update_latent(self.writer)
                     self.algo.update_sac(self.writer)
 
-            # Evaluate regularly.
             step_env = step * self.action_repeat
+            # Evaluate regularly.
             if step_env % self.eval_interval == 0:
+                self.algo.save_model(self.model_dir + f"/step_env={step_env}")
+                
                 self.evaluate(step_env)
             
-            if step_env%1000==0:
+            # LR Schedule.
+            if step_env % 1000 == 0:
                 for sched in self.algo.scheds:
                     sched.step()
             
-            if step_env%self.algo.epoch_len == 0:
-                self.writer.add_scalar("cost/train", np.mean(self.algo.epoch_costreturns), global_step=step_env)
-                self.writer.add_scalar("return/train", np.mean(self.algo.epoch_rewardreturns), global_step=step_env)
+            # record every epoch
+            if step_env % self.algo.epoch_len == 0:
+                self.writer.add_scalar("cost/train_step", np.mean(self.algo.epoch_costreturns), global_step=step_env)
+                self.writer.add_scalar("return/train_step", np.mean(self.algo.epoch_rewardreturns), global_step=step_env)
+                self.writer.add_scalar("safety_violation/train_step", np.mean(self.algo.epoch_safetyviolations), global_step=step_env)
                 self.algo.epoch_costreturns = []
                 self.algo.epoch_rewardreturns = []
-            
-
+                self.algo.epoch_safetyviolations = []
+        self.algo.save_model(self.model_dir + f"/final")
         # Wait for logging to be finished.
         sleep(10)
 
     def evaluate(self, step_env):
         reward_returns = []
         cost_returns = []
+        safety_violations = []
         steps_until_dump_obs = 20
         def coord_to_im_(coord):
             coord = (coord+1.5)*100
@@ -188,6 +202,7 @@ class Trainer:
             self.env_test.unwrapped.sim.render_contexts[0].vopt.geomgroup[:] = 1 # render all objects, including hazards
             episode_return = 0.0
             cost_return = 0.0
+            safety_violation = 0
             done = False
             eval_step = 0
             while not done:
@@ -218,23 +233,38 @@ class Trainer:
                 self.ob_test.append(state, action)
                 episode_return += reward
                 cost_return += cost
+                if cost > 0:
+                    safety_violation += 1
 
                 eval_step += 1
             if i==0:
                 self.writer.add_video(f"vid/eval", [np.concatenate([obs_list,recons_list,track_list], axis=3)], global_step=step_env, fps=video_fps)
             reward_returns.append(episode_return)
             cost_returns.append(cost_return)
+            safety_violations.append(safety_violation / eval_step)
         self.algo.z1 = None
         self.algo.z2 = None
 
         # Log to CSV.
         self.log["step"].append(step_env)
         mean_reward_return = np.mean(reward_returns)
-        mean_cost_return = np.mean(cost_returns)
+        std_reward_return = np.std(reward_returns)
         median_reward_return = np.median(reward_returns)
+
+        mean_cost_return = np.mean(cost_returns)
+        std_cost_return = np.std(cost_returns)
         median_cost_return = np.median(cost_return)
-        self.log["return"].append(mean_reward_return)
-        self.log["cost"].append(mean_cost_return)
+
+        mean_safety_violation = np.mean(safety_violations)
+        std_safety_violation = np.std(safety_violations)
+        median_safety_violation = np.median(safety_violations)
+
+        self.log["mean_return"].append(mean_reward_return)
+        self.log["std_return"].append(std_reward_return)
+        self.log["mean_cost"].append(mean_cost_return)
+        self.log["std_cost"].append(std_cost_return)
+        self.log["mean_safety_violation"].append(mean_safety_violation)
+        self.log["std_safety_violation"].append(std_safety_violation)
         pd.DataFrame(self.log).to_csv(self.csv_path, index=False)
 
         # Log to TensorBoard.
@@ -242,8 +272,11 @@ class Trainer:
         self.writer.add_scalar("return/test_median", median_reward_return, step_env)
         self.writer.add_scalar("cost/test", mean_cost_return, step_env)
         self.writer.add_scalar("cost/test_median", median_cost_return, step_env)
+        self.writer.add_scalar("safety_violation/test", mean_safety_violation, step_env)
+        self.writer.add_scalar("safety_violation/test_median", median_safety_violation, step_env)
         self.writer.add_histogram("return/test_hist", np.array(reward_returns), step_env)
         self.writer.add_histogram("cost/test_hist", np.array(cost_returns), step_env)
+        self.writer.add_histogram("safety_violation/test_hist", np.array(safety_violations), step_env)
         
         print(f"Steps: {step_env:<6}   " f"Return: {mean_reward_return:<5.1f} " f"CostRet: {mean_cost_return:<5.1f}   " f"Time: {self.time}")
 
